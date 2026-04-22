@@ -1,0 +1,335 @@
+---
+title: "Microbial Ecology Tutorial"
+author: "Carly E. Karrick"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This code can be used as an introduction to analyzing microbiome data. It will cover basics of microbial ecology, from importing counts tables to generating plots and running statistical analyses.
+
+First, set up the R environment by setting the working directory, which contains the files for the tutorial.
+```{r configure environment}
+# Clear the global environment
+rm(list = ls())
+
+# Identify the path to the working directory, change to where you are working
+wd_path <- "/Users/carlykarrick/Downloads/DSAI_Fellowship/Spring26/blog/data"
+
+# Set the working directory
+setwd(wd_path)
+```
+
+Install and load required packages.
+```{r install and load packages}
+# Make a vector of required packages
+required_pkgs <- c("phyloseq", "tidyverse", "qiime2R", "vegan", "FSA", "devtools", "pairwiseAdonis", "corncob", "ANCOMBC")
+
+# Make a vector of packages not installed
+pkgs_not_installed <- required_pkgs[!sapply(required_pkgs, function(p) require(p, character.only = T))]
+
+# Install missing packages
+if(length(pkgs_not_installed) > 0) install.packages(pkgs_not_installed, dependencies = TRUE)
+
+# Install qiime2R, if necessary
+if("qiime2R" %in% pkgs_not_installed) remotes::install_github("jbisanz/qiime2R")
+
+# Install pairwiseAdonis, if necessary
+if("pairwiseAdonis" %in% pkgs_not_installed) devtools::install_github("pmartinezarbizu/pairwiseAdonis/pairwiseAdonis")
+
+# Load the required packages
+lapply(required_pkgs, library, character.only = TRUE)
+```
+
+Import the data using phyloseq.
+```{r import data}
+# Import the feature table (counts table)
+feature_table <- read_qza("tableV_BacArc_99_SCTLD.qza")$data
+
+# Import the taxonomy table as a data frame
+taxonomy_table <- as.data.frame(read_tsv("taxonomy.tsv"))
+
+# Import metadata
+metadata <- read.csv("SCTLD_meta_analysis_metadata.csv", header = TRUE, row.names = 1, na.strings = c("", "NA"))
+
+# Assign the row names of the taxonomy table as the Feature_ID column, then remove that column and the Consensus column from the data frame and parse the Taxon column into separate columns per taxonomic rank before renaming NAs as "Unassigned"
+rownames(taxonomy_table) <- taxonomy_table$Feature_ID
+taxonomy_table_parsed <- taxonomy_table %>%
+  select(-Feature_ID, -Consensus) %>%
+  separate(
+    Taxon,
+    into = c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species"),
+    sep = ";\\s*|;"
+  ) %>%
+  mutate(across(everything(), ~ sub("^[a-z]__", "", trimws(.)))) %>%
+  mutate(across(everything(), ~ replace_na(., "Unassigned")))
+
+# Convert taxonomy_table_parsed to a matrix
+taxonomy_mat <- as.matrix(taxonomy_table_parsed)
+
+# Transform the tables into phyloseq components
+ASV = otu_table(feature_table, taxa_are_rows = TRUE)
+TAX = tax_table(taxonomy_mat)
+samples = sample_data(metadata)
+
+# Combine phyloseq components into one phyloseq objects
+ps <- phyloseq(ASV, TAX, samples)
+```
+
+Filter low abundance taxa, if applicable.
+```{r filter low abundance taxa}
+# To filter based on prevalence (i.e., presence in % of samples), identify cutoffs for the number of reads in the percentage of samples
+read_cutoff <- 10 # taxa must have at least this number of reads
+prev_cutoff <- 0.1 # in this % of samples
+
+# Filter based on prevalence (i.e., presence in % of samples)
+ps_filt <- filter_taxa(ps, function(x) sum(x > read_cutoff) >= (prev_cutoff * nsamples(ps)), prune = TRUE)
+```
+
+Normalize data by converting to relative abundance or rarefying data, though the latter is debated.
+```{r normalize data}
+# Normalize by converting to relative abundance
+ps_rel_abund <- transform_sample_counts(ps_filt, function(x) x / sum(x))
+
+# Create a rarefaction curve to decide sequencing depth cutoff for rarefying data (alternative, debated normalization method)
+rarefaction_curve <- rarecurve(feature_table, step = 50, label = FALSE, xlim = c(0, 10000))
+rarefaction_curve # View the rarefaction curve generated above
+
+# Set the seed for reproducibility
+set.seed(123)
+
+# Alternative method to normalize data via rarefying
+ps_rarefy <- rarefy_even_depth(ps_filt, sample.size = 10000)
+```
+
+Subset and group samples, if applicable.
+```{r subset and group samples}
+# Subset samples to only include Colpophyllia natans corals
+ps_cnat <- subset_samples(ps_rel_abund, species_code == "CNAT")
+
+# From the subset of Colpophyllia natans samples, group samples by tissue health state
+ps_cnat_health <- merge_samples(ps_cnat, "tissue_type")
+
+# Reconvert to relative abundance, if necessary
+ps_cnat_health_rel_abund <- transform_sample_counts(ps_cnat_health, function(x) x / sum(x))
+```
+
+Calculate alpha diversity and see whether it varies significantly across groups.
+```{r alpha diversity}
+# Calculate alpha diversity using the rarefied data
+alpha_div <- estimate_richness(ps_rarefy, measures = c("Observed", "Chao1", "Shannon", "InvSimpson"))
+
+# Reset the row names to the original sample names
+rownames(alpha_div) <- sample_names(ps_rarefy)
+
+# Add the metadata to the alpha diversity table and add a column recoding binary_disease to "Y" or "N"
+alpha_div_meta <- alpha_div %>%
+  rownames_to_column("SampleID") %>%
+  left_join(samples, by = "SampleID") %>%
+  mutate(
+    binary_disease = case_when(
+      tolower(binary_disease) == "y" ~ "Y", 
+      tolower(binary_disease) == "n" ~ "N", 
+      TRUE ~ NA_character_
+    )
+  )
+
+# Run a Wilcoxon rank sum test to compare Shannon diversity across binary_disease
+wilcox.test(Shannon ~ binary_disease, data = alpha_div_meta)
+
+# Run a Kruskal-Wallis test to compare Shannon diversity across health states
+kruskal.test(Shannon ~ tissue_type, data = alpha_div_meta)
+
+# Run a Dunn's test with Benjamini-Hochberg correction for a post-hoc test
+dunnTest(Shannon ~ tissue_type, data = alpha_div_meta, method = "bh")
+
+# Run a Spearman correlation to compare alpha diversity across depth (continuous variable)
+cor.test(as.numeric(alpha_div_meta$depth), alpha_div_meta$Shannon, method = "spearman")
+
+# Make a boxplot of Shannon diversity for different tissue types
+alpha_div_meta %>%
+  ggplot(aes(x = tissue_type, y = Shannon, fill = tissue_type)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) + 
+  geom_jitter(width = 0.2, alpha = 0.5) + 
+  theme_classic() + 
+  labs(
+    title = "Shannon Diversity Across Tissue Types", 
+    x = "Tissue Type", 
+    y = "Shannon Diversity"
+  ) + 
+  theme(legend.position = "none")
+
+# Make a scatter plot of Shannon diversity vs. depth
+alpha_div_meta %>%
+  ggplot(aes(x = as.numeric(depth), y = Shannon)) + 
+  geom_point(alpha = 0.6) + 
+  geom_smooth(method = "lm", se = TRUE) + 
+  theme_classic() + 
+  labs(
+    title = "Shannon Diversity vs. Depth", 
+    x = "Depth", 
+    y = "Shannon Diversity"
+  )
+```
+
+Calculate beta diversity and see whether it significantly differs across groups.
+```{r beta diversity}
+# Identify samples that do not have NAs for tissue type
+tissues_NA <- data.frame(sample_data(ps)) %>%
+  filter(!is.na(tissue_type))
+
+# Subset the phyloseq objects to only include samples with non-NA tissue type
+ps_rel_abund_noNA <- prune_samples(tissues_NA$SampleID, ps_rel_abund)
+
+# Calculate beta diversity
+bray_dist <- phyloseq::distance(ps_rel_abund_noNA, method = "bray", na.rm = TRUE)
+jaccard_dist <- phyloseq::distance(ps_rel_abund_noNA, method = "jaccard", na.rm = TRUE)
+
+# Test homogeneity of dispersion with PERMDISP
+anova(betadisper(bray_dist, sample_data(ps_rel_abund_noNA)$tissue_type))
+anova(betadisper(jaccard_dist, sample_data(ps_rel_abund_noNA)$tissue_type))
+
+# Determine the number of samples to include in random subsets since PERMDISP had p < 0.05
+min_n <- min(table(sample_data(ps_rel_abund_noNA)$tissue_type))
+
+# Determine the subset of samples to include
+set.seed(123) # set seed for reproducibility
+sub <- sample_data(ps_rel_abund_noNA) %>%
+  group_by(tissue_type) %>%
+  slice_sample(n = min_n) %>%
+  ungroup()
+
+# Subset the phyloseq object
+ps_rel_abund_sub <- prune_samples(sub$SampleID, ps_rel_abund_noNA)
+
+# Recalculate the distance
+bray_dist_sub <- phyloseq::distance(ps_rel_abund_sub, method = "bray")
+jaccard_dist_sub <- phyloseq::distance(ps_rel_abund_sub, method = "jaccard")
+
+# Run PERMANOVA to see if community composition differs between groups
+adonis2(bray_dist_sub ~ tissue_type, data = data.frame(sample_data(ps_rel_abund_sub)), permutations = 999)
+adonis2(jaccard_dist_sub ~ tissue_type, data = data.frame(sample_data(ps_rel_abund_sub)), permutations = 999)
+
+# Perform pairwise PERMANOVA
+pairwise.adonis(bray_dist_sub, factors = sample_data(ps_rel_abund_sub)$tissue_type)
+pairwise.adonis(jaccard_dist_sub, factors = sample_data(ps_rel_abund_sub)$tissue_type)
+
+# Ordinate the data
+ord_pcoa_bray <- ordinate(ps_rel_abund_sub, method = "PCoA", distance = "bray")
+ord_nmds_jaccard <- ordinate(ps_rel_abund_sub, method = "NMDS", distance = "jaccard")
+
+# Get data frames from the ordinations
+ord_df_pcoa_bray <- plot_ordination(ps_rel_abund_sub, ord_pcoa_bray, type = "samples", color = "tissue_type")$data
+ord_df_nmds_jaccard <- plot_ordination(ps_rel_abund_sub, ord_nmds_jaccard, type = "samples", color = "tissue_type")$data %>%
+  rename(
+    Axis.1 = NMDS1, 
+    Axis.2 = NMDS2
+  )
+
+# Write a function to plot the ordinations
+# ord_df: ordination created above, example: ord_pcoa_bray
+# plot_title: main title of plot, written as a string, ex: "PCoA of Bray-Curtis Distances
+# x_title: x-axis title, written as a string, ex: "PC1"
+# y_title: y-axis title, written as a string, ex: "PC2"
+ord_plot <- function(ord_df, plot_title, x_title, y_title){
+  # Make the plot
+  p <- ord_df %>%
+    ggplot(aes(x = Axis.1, y = Axis.2, color = tissue_type)) + 
+    geom_point(alpha = 0.7, size = 3) + 
+    stat_ellipse(type = "t", level = 0.95) + 
+    theme_classic() + 
+    labs(
+      title = plot_title, 
+      x = x_title, 
+      y = y_title
+    )
+  
+  # Return the plot
+  return(p)
+}
+
+# Plot the ordinations
+ord_plot(ord_df_pcoa_bray, plot_title = "PCoA of Bray-Curtis Distances", x_title = "PCoA1", y_title = "PCoA2")
+ord_plot(ord_df_nmds_jaccard, plot_title = "NMDS of Jaccard Distances", x_title = "NMDS1", y_title = "NMDS2")
+```
+
+Investigate taxonomic composition.
+```{r taxonomic composition plots}
+# Convert the phyloseq object to a data frame
+df <- psmelt(ps_cnat_health_rel_abund)
+
+# Plot a stacked relative abundance of bacterial phyla across tissue health states in Colpophyllia natans
+df %>%
+  ggplot(aes(x = Sample, y = Abundance, fill = Phylum, color = Phylum)) + 
+  geom_bar(stat = "identity") + 
+  theme_classic() + 
+  theme(
+    axis.title = element_text(size = 12, color = "black"), 
+    axis.text = element_text(size = 12, color = "black")
+  ) + 
+  labs(
+    x = "Tissue Health State", 
+    y = "Relative Abundance"
+  )
+
+# Convert abundance to the log scale
+ps_log <- transform_sample_counts(ps_cnat_health_rel_abund, function(x) log10(x + 1e-6))
+
+# Convert the log scale abundance phyloseq object to a data frame
+df_log <- psmelt(ps_log)
+
+# Plot a heatmap
+df_log %>%
+  ggplot(aes(x = Sample, y = Phylum, fill = Abundance)) + 
+  geom_tile() + 
+  scale_fill_viridis_c() + 
+  theme_classic() + 
+  labs(
+    title = "Phylum-Level Heatmap of C. natans", 
+    x = "Tissue Health State", 
+    y = "Phylum", 
+    fill = "Log10 Abundance"
+  )
+```
+
+Perform differential abundance analyses.
+```{r differential abundance}
+# Ensure the variable of interest (i.e., tissue_type) is a factor
+sample_data(ps_rarefy)$tissue_type <- factor(sample_data(ps_rarefy)$tissue_type, levels = c("AH", "DU", "DL"))
+
+# Run corncob
+corncob_res <- differentialTest(
+  formula = ~ tissue_type, 
+  phi.formula = ~ tissue_type, 
+  formula_null = ~ 1, 
+  phi.formula_null = ~ 1, 
+  test = "Wald", 
+  data = ps_rarefy
+)
+
+# Filter results to only include significantly differentially abundant taxa
+corncob_res_sig <- corncob_res$significant_taxa
+
+# Filter the taxonomy table to only include corncob-identified differentially abundant taxa
+corncob_res_sig_with_tax <- taxonomy_table %>%
+  filter(Feature_ID %in% corncob_res_sig)
+
+# Run ANCOM-BC
+ancombc_res <- ancombc2(
+  data = ps_rarefy, 
+  fix_formula = "tissue_type", 
+  p_adj_method = "BH", 
+  lib_cut = 1000, 
+  group = "tissue_type", 
+  struc_zero = TRUE, 
+  neg_lb = TRUE
+)$res
+```
+
+
+
